@@ -1,1 +1,252 @@
+#Elbow Method
+wcss = []
+k_range = range(2, 11)  # Testez de 2 à 10 clusters
 
+for k in k_range:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+    kmeans.fit(embeddings)
+    wcss.append(kmeans.inertia_)
+
+plt.plot(k_range, wcss, 'bx-')
+plt.xlabel('Nombre de clusters')
+plt.ylabel('WCSS')
+plt.title('Méthode du Coude')
+plt.show()
+
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+
+
+
+# ----------------------------------
+# 1. Model Components: Autoencoder and Clustering Layer
+# ----------------------------------
+
+def build_autoencoder(input_dim, encoding_dim=256):
+    """
+    Build a simple autoencoder for dimensionality reduction.
+    The encoder will be used to initialize the deep clustering pipeline.
+    """
+    input_layer = keras.Input(shape=(input_dim,))
+    # Encoder network
+    encoded = layers.Dense(512, activation='relu')(input_layer)
+    encoded = layers.Dense(encoding_dim, activation='relu')(encoded)
+    # Decoder network
+    decoded = layers.Dense(512, activation='relu')(encoded)
+    decoded = layers.Dense(input_dim, activation='sigmoid')(decoded)
+    # Autoencoder model
+    autoencoder = keras.Model(input_layer, decoded, name="autoencoder")
+    # Encoder model for feature extraction
+    encoder = keras.Model(input_layer, encoded, name="encoder")
+
+    autoencoder.compile(optimizer='adam', loss='mse')
+    return autoencoder, encoder
+
+class ClusteringLayer(layers.Layer):
+    """
+    Clustering layer as defined in DEC. It converts input latent feature
+    vectors into soft cluster assignment probabilities using Student's t-distribution.
+    """
+    def __init__(self, n_clusters, weights=None, **kwargs):
+        super(ClusteringLayer, self).__init__(**kwargs)
+        self.n_clusters = n_clusters
+        self.initial_weights = weights
+
+    def build(self, input_shape):
+        input_dim = input_shape[-1]
+        # Initialize cluster centers as trainable weights
+        self.clusters = self.add_weight(
+            shape=(self.n_clusters, input_dim),
+            initializer='glorot_uniform',
+            name='clusters'
+        )
+        if self.initial_weights is not None:
+            self.set_weights(self.initial_weights)
+            self.initial_weights = None
+        super(ClusteringLayer, self).build(input_shape)
+
+    def call(self, inputs, **kwargs):
+        # Compute squared Euclidean distance between inputs and cluster centers
+        expanded_inputs = tf.expand_dims(inputs, axis=1)
+        distances = tf.reduce_sum(tf.square(expanded_inputs - self.clusters), axis=2)
+        # Compute Student's t-distribution, degree of freedom = 1
+        q = 1.0 / (1.0 + distances)
+        q **= ((1 + 1.0) / 2.0)
+        # Normalize to get soft assignments
+        q = tf.transpose(tf.transpose(q) / tf.reduce_sum(q, axis=1))
+        return q
+
+# ----------------------------------
+# 2. Target Distribution Function
+# ----------------------------------
+
+def target_distribution(q):
+    """
+    Compute the target distribution p, as defined in the DEC paper.
+    """
+    weight = q ** 2 / np.sum(q, axis=0)
+    return (weight.T / np.sum(weight, axis=1)).T
+
+# ----------------------------------
+# 3. DEC and IDEC Training Functions
+# ----------------------------------
+
+def train_DEC(encoder, embeddings, n_clusters, epochs_DEC=100, update_interval=10, batch_size=256):
+    """
+    Train DEC (Deep Embedded Clustering).
+    Steps:
+     1. Obtain latent representations.
+     2. Initialize cluster centers with KMeans.
+     3. Build the DEC model by adding a ClusteringLayer.
+     4. Iteratively update the target distribution and train with KLD loss.
+    """
+    # Obtain latent representations
+    latent = encoder.predict(embeddings, verbose=0)
+
+    # Initialize cluster centers using KMeans
+    kmeans = KMeans(n_clusters=n_clusters, n_init=20, random_state=42)
+    _ = kmeans.fit_predict(latent)
+    cluster_centers = [kmeans.cluster_centers_]
+
+    # Build DEC model by attaching the clustering layer on top of encoder outputs.
+    clustering_layer = ClusteringLayer(n_clusters, weights=cluster_centers, name='clustering')(encoder.output)
+    DEC_model = keras.Model(inputs=encoder.input, outputs=clustering_layer, name="DEC_model")
+    DEC_model.compile(optimizer='adam', loss='kld')
+
+    # Training loop: update target distribution every update_interval epochs.
+    for epoch in range(epochs_DEC):
+        if epoch % update_interval == 0:
+            q = DEC_model.predict(embeddings, verbose=0)
+            p = target_distribution(q)
+        DEC_model.fit(embeddings, p, epochs=1, batch_size=batch_size, verbose=0)
+        if epoch % update_interval == 0:
+            print(f"DEC Epoch {epoch}/{epochs_DEC}")
+    return DEC_model
+
+def train_IDEC(autoencoder, encoder, embeddings, n_clusters, epochs_IDEC=100, update_interval=10, batch_size=256, gamma=0.1):
+    """
+    Train IDEC (Improved Deep Embedded Clustering) that incorporates
+    both a clustering loss (KLD) and a reconstruction loss (MSE).
+    """
+    # Obtain latent representations for KMeans initialization
+    latent = encoder.predict(embeddings, verbose=0)
+    kmeans = KMeans(n_clusters=n_clusters, n_init=20, random_state=42)
+    _ = kmeans.fit_predict(latent)
+    cluster_centers = [kmeans.cluster_centers_]
+
+    # Build IDEC model with two outputs: clustering and reconstruction.
+    clustering_layer = ClusteringLayer(n_clusters, weights=cluster_centers, name='clustering_output')(encoder.output)
+    reconstruction_output = layers.Lambda(lambda x: x, name='reconstruction_output')(autoencoder(encoder.input))
+    IDEC_model = keras.Model(inputs=encoder.input,
+                             outputs=[clustering_layer, reconstruction_output],
+                             name="IDEC_model")
+    IDEC_model.compile(optimizer='adam',
+                       loss={'clustering_output': 'kld', 'reconstruction_output': 'mse'},
+                       loss_weights={'clustering_output': 1.0, 'reconstruction_output': gamma})
+
+    # Training loop: update target distribution for clustering loss periodically.
+    for epoch in range(epochs_IDEC):
+        if epoch % update_interval == 0:
+            q, _ = IDEC_model.predict(embeddings, verbose=0)
+            p = target_distribution(q)
+        IDEC_model.fit(embeddings,
+                       {'clustering_output': p, 'reconstruction_output': embeddings},
+                       epochs=1,
+                       batch_size=batch_size,
+                       verbose=0)
+        if epoch % update_interval == 0:
+            print(f"IDEC Epoch {epoch}/{epochs_IDEC}")
+    return IDEC_model
+def visualize_clusters(latent, labels, title):
+    """
+    Réduit les dimensions des caractéristiques latentes à 2D avec t-SNE
+    et affiche un scatter plot coloré selon les labels.
+    """
+    tsne = TSNE(n_components=2, random_state=42)
+    latent_2d = tsne.fit_transform(latent)
+
+    plt.figure(figsize=(8, 6))
+    scatter = plt.scatter(latent_2d[:,0], latent_2d[:,1], c=labels, cmap='viridis', alpha=0.7)
+    plt.title(title)
+    plt.xlabel("t-SNE Dimension 1")
+    plt.ylabel("t-SNE Dimension 2")
+    plt.colorbar(scatter, label='Cluster')
+    plt.show()
+# ----------------------------------
+# 4. Comparison Function (No Ground Truth)
+# ----------------------------------
+
+def compare_DEC_IDEC(embeddings, n_clusters=10):
+    """
+    Compares DEC and IDEC using the provided BERT embeddings.
+    Evaluates clustering quality using the silhouette score.
+    Cloning is used to perform DEC and IDEC experiments separately.
+    """
+    input_dim = embeddings.shape[1]
+
+    # Build and pretrain the autoencoder and encoder.
+    autoencoder, encoder = build_autoencoder(input_dim)
+    print("Pretraining autoencoder...")
+    autoencoder.fit(embeddings, embeddings, epochs=50, batch_size=256, verbose=0)
+    print("Pretraining complete.\n")
+
+    # Clone models for independent experiments:
+    dec_encoder = keras.models.clone_model(encoder)
+    dec_encoder.set_weights(encoder.get_weights())
+
+    idec_autoencoder = keras.models.clone_model(autoencoder)
+    idec_autoencoder.set_weights(autoencoder.get_weights())
+    idec_encoder = keras.models.clone_model(encoder)
+    idec_encoder.set_weights(encoder.get_weights())
+
+    # Train DEC on dec_encoder
+    print("Training DEC model...")
+    dec_model = train_DEC(dec_encoder, embeddings, n_clusters, epochs_DEC=100, update_interval=10)
+
+    # Train IDEC on idec_encoder and idec_autoencoder
+    print("\nTraining IDEC model...")
+    idec_model = train_IDEC(idec_autoencoder, idec_encoder, embeddings, n_clusters, epochs_IDEC=100, update_interval=10, gamma=0.1)
+
+    # -------------------------------
+    # 5. Evaluation using Silhouette Score (Higher is better)
+    # -------------------------------
+    # For DEC:
+    q_dec = dec_model.predict(embeddings, verbose=0)
+    labels_dec = np.argmax(q_dec, axis=1)
+    latent_dec = dec_encoder.predict(embeddings, verbose=0)
+    score_dec = silhouette_score(latent_dec, labels_dec)
+
+    # For IDEC:
+    q_idec, _ = idec_model.predict(embeddings, verbose=0)
+    labels_idec = np.argmax(q_idec, axis=1)
+    latent_idec = idec_encoder.predict(embeddings, verbose=0)
+    score_idec = silhouette_score(latent_idec, labels_idec)
+
+    print("\nClustering performance (Silhouette Score):")
+    print(f"DEC Silhouette Score:  {score_dec:.4f}")
+    print(f"IDEC Silhouette Score: {score_idec:.4f}")
+    # Visualisation des clusters avec t-SNE
+    visualize_clusters(latent_dec, labels_dec, "Clusters DEC (t-SNE)")
+    visualize_clusters(latent_idec, labels_idec, "Clusters IDEC (t-SNE)")
+
+# ----------------------------------
+# 6. Run the Comparison Experiment
+# ----------------------------------
+
+if __name__ == "__main__":
+    # 'data' should be your existing BERT embeddings (a 2D NumPy array).
+    # For example, if you have saved the embeddings in a .npy file, load them as follows:
+    # data = np.load('your_bert_embeddings.npy')
+
+    try:
+        data
+    except NameError:
+        raise NameError("The variable 'data' is not defined. Please load or set your BERT embeddings into 'data'.")
+
+    compare_DEC_IDEC(data, n_clusters=3)
