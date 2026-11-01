@@ -1,1 +1,122 @@
+from pyrdf2vec.connectors import Connector
+from rdflib_hdt import HDTDocument
+from typing import List, Optional
 
+class HDTConnector(Connector):
+    def __init__(self, hdt_path: str):
+        super().__init__()
+        self.hdt_doc = HDTDocument(hdt_path)
+
+    def get_relations(self, entity: str) -> List[str]:
+        triples, _ = self.hdt_doc.search_triples(entity, None, None)
+        return list({triple[1] for triple in triples})
+
+    def get_objects(self, entity: str, predicate: str) -> List[str]:
+        triples, _ = self.hdt_doc.search_triples(entity, predicate, None)
+        return [triple[2] for triple in triples]
+
+    def get_subjects(self, predicate: str, obj: str) -> List[str]:
+        triples, _ = self.hdt_doc.search_triples(None, predicate, obj)
+        return [triple[0] for triple in triples]
+
+    def get_predicates(self) -> List[str]:
+        # Note: This may be slow for large datasets.
+        triples, _ = self.hdt_doc.search_triples("", "", "")
+        return list({triple[1] for triple in triples})
+
+    def is_uri(self, entity: str) -> bool:
+        return not self.is_literal(entity)
+
+    def is_literal(self, entity: str) -> bool:
+        # Simple check for literals (modify based on your data)
+        return '"' in entity or "'" in entity
+
+    # Implement other required methods with placeholders if necessary.
+    def get_invs(self, predicate: str) -> List[str]:
+        return []  # Adjust if inverse predicates are needed
+
+    def get_types(self, entity: str) -> List[str]:
+        return []
+
+    def get_literal_value(self, entity: str) -> str:
+        return entity
+
+    def get_lexical_form(self, entity: str) -> str:
+        return entity
+
+
+
+from pyrdf2vec.connectors import SPARQLConnector
+import json
+
+class HDTConnector(SPARQLConnector):
+    def __init__(self, filename):
+        self.store = HDTStore(filename)
+        self.graph = Graph(self.store)
+
+    def fetch(self, query: str):
+        try:
+            res = self.graph.query(query)
+            #print(json.loads(res.serialize(format="json")))
+            noi = URIRef(query.split("<")[-1].split(">")[0])
+            res = self.store.hdt_document.search((noi,None, None))[0]
+            #{'p': {'type': 'uri', 'value': 'http://dbpedia.org/ontology/wikiPageID'}, 'o': {'type': 'literal', 'value': '40334605', 'datatype': 'http://www.w3.org/2001/XMLSchema#integer'}}
+            val = [{"p":{"value":r[1].toPython()},"o":{"value":r[2].n3().split('"')[1]}} if isinstance(r[2], Literal) else {"p":{"value":r[1].toPython()},"o":{"value":r[2].toPython()}} for r in res]
+            #for r in res:
+                #try:
+            #    if isinstance(r[2], Literal):
+            #        val.append()
+            #    else:
+            #        val.append()
+            #print(json.loads(res.serialize(format="json")))
+            return {"results":{"bindings":val}}
+            #return json.loads(res.serialize(format="json"))#['results']['bindings']
+        except Exception as e:
+        #    print(e)
+            return {"results":{"bindings":[]}}
+from pyrdf2vec import RDF2VecTransformer
+from pyrdf2vec.walkers import RandomWalker
+
+# Initialize the HDT Connector
+connector = HDTConnector("/content/Online_Retail.hdt")
+
+# Define entities to embed (example list)
+
+#Extract Person Entities with Full Context
+from rdflib import Graph, URIRef
+g = Graph()
+g.parse("/content/OnlineRetailKGG.ttl", format="turtle")
+
+
+# Namespace setup
+ns = {"ex": "http://example.org/OnlineRetail#"}
+person_class = URIRef(ns["ex"] + "Person")
+
+# Get all unique persons
+person_uris = set(g.subjects(predicate=URIRef("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                           object=person_class))
+# Extract clean URIs into a list
+customer_uris = [str(uri) for uri in person_uris]
+customer_uris
+from pyrdf2vec import RDF2VecTransformer
+from pyrdf2vec.walkers import RandomWalker
+from pyrdf2vec.graphs import KG
+# Defined the MUTAG KG, as well as a set of predicates to exclude from
+# this KG and a list of predicate chains to get the literals.
+graph = KG()
+graph.connector = HDTConnector("/content/Online_Retaill.hdt")
+
+from pyrdf2vec import RDF2VecTransformer
+from pyrdf2vec.embedders import Word2Vec
+from pyrdf2vec.walkers import RandomWalker
+
+transformer = RDF2VecTransformer(
+    Word2Vec(vector_size=1000, sg=1),
+    walkers=[RandomWalker(2, 500, n_jobs=4, with_reverse=False)],
+    verbose=1
+)
+embeddings= transformer.fit_transform(
+   graph,
+   customer_uris
+)
+embeddings
